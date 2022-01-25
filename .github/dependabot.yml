@@ -6,5 +6,5 @@ updates:
   - package-ecosystem: gomod
     directory: /
     schedule: {interval: monthly}
-    reviewers: [freifunkMUC/salt-stack]
-    assignees: [freifunkMUC/salt-stack]
+    reviewers: [freifunkMUC/wg-access-server]
+    assignees: [freifunkMUC/wg-access-server]
