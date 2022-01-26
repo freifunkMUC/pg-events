@@ -10,7 +10,7 @@ if [[ ! "$(docker ps -aqf name=$CONTAINER_NAME)" ]]; then
     -p 5432:5432 \
     -d \
     --name "$CONTAINER_NAME" \
-    postgres:11-alpine
+    postgres:14-alpine
 else
   docker start "$CONTAINER_NAME"
 fi
