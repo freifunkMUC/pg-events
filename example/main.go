@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/freifunkMUC/pg-events/pkg/pgevents"
+
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/postgres"
 	"github.com/pkg/errors"
-	"github.com/place1/pg-events/pkg/pgevents"
 	"github.com/sirupsen/logrus"
 )
 
