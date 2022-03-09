@@ -1,4 +1,4 @@
-module github.com/place1/pg-events
+module github.com/freifunkMUC/pg-events
 
 go 1.13
 
