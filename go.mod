@@ -1,6 +1,6 @@
 module github.com/freifunkMUC/pg-events
 
-go 1.13
+go 1.16
 
 require (
 	github.com/jinzhu/gorm v1.9.16
