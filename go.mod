@@ -1,6 +1,6 @@
 module github.com/freifunkMUC/pg-events
 
-go 1.23.0
+go 1.24.0
 
 require (
 	github.com/jinzhu/gorm v1.9.16
@@ -13,5 +13,5 @@ require (
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/mattn/go-sqlite3 v1.14.19 // indirect
 	golang.org/x/crypto v0.35.0 // indirect
-	golang.org/x/sys v0.33.0 // indirect
+	golang.org/x/sys v0.36.0 // indirect
 )
