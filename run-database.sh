@@ -10,9 +10,11 @@ if [[ ! "$(docker ps -aqf name=$CONTAINER_NAME)" ]]; then
     -p 5432:5432 \
     -d \
     --name "$CONTAINER_NAME" \
-    postgres:14-alpine
+    postgres:17-alpine
 else
   docker start "$CONTAINER_NAME"
 fi
 
 echo "started container -> $CONTAINER_NAME"
+echo "run the tests with:"
+echo "  PGEVENTS_TEST_DATABASE_URL='postgres://postgres:development@localhost:5432/postgres?sslmode=disable' go test -race ./..."

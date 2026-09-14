@@ -14,7 +14,23 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go: [ '1.25', '1.26' ]
+        go: [ '1.26', '1.27' ]
+
+    # The tests talk to a real Postgres: LISTEN/NOTIFY, triggers and advisory
+    # locks cannot be faked meaningfully.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: development
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -27,5 +43,11 @@ jobs:
     - name: Build
       run: go build -v ./...
 
+    - name: Build example
+      working-directory: example
+      run: go build -v ./...
+
     - name: Test
-      run: go test -v ./...
+      env:
+        PGEVENTS_TEST_DATABASE_URL: postgres://postgres:development@localhost:5432/postgres?sslmode=disable
+      run: go test -race -v ./...
