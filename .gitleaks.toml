@@ -1,0 +1,7 @@
+title = "Gitleaks configuration"
+
+[extend]
+# the rules gitleaks ships with; this file exists so that the workflow reads
+# the same configuration in every repository, and so that an exception has a
+# place to live. There is nothing to allow here today.
+useDefault = true
