@@ -92,6 +92,19 @@ A name may name its schema: `Attach("reporting.events")`, and each part is quote
 own. A dot inside a quoted name stays part of the name, so `Attach("\"reports.2026\"")`
 refers to one table.
 
+## Connections
+
+The listener keeps one connection of its own for `LISTEN`, because a connection
+that listens cannot be shared or handed back to a pool. When it breaks - a server
+restart, a network that drops the flow - the listener reconnects by itself, waiting
+longer between attempts up to a minute, and then calls the `OnReconnect` callbacks:
+notifications sent while there was no connection are gone, so whatever keeps a copy
+of the data has to read it again. A connection nothing arrives on is checked once a
+minute, so one that went away silently is noticed rather than waited on forever.
+
+`OpenListener` connects before it returns, so a database that cannot be reached is
+an error you get there and not a line in the log every few seconds.
+
 ## Running several applications against one database
 
 `OpenListener` and `Attach` install their function and trigger under an advisory
