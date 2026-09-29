@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -36,6 +37,11 @@ func openGorm(connectionString string) (*gorm.DB, error) {
 func main() {
 	logrus.SetLevel(logrus.DebugLevel)
 
+	// The context bounds getting started, not the listener's life: it runs
+	// until Close.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	connectionString := "host=localhost port=5432 sslmode=disable dbname=postgres user=postgres password=development"
 
 	db, err := openGorm(connectionString)
@@ -43,13 +49,13 @@ func main() {
 		logrus.Fatal(err)
 	}
 
-	listener, err := pgevents.OpenListener(connectionString)
+	listener, err := pgevents.OpenListener(ctx, connectionString)
 	if err != nil {
 		logrus.Fatal(err)
 	}
 	defer func() { _ = listener.Close() }()
 
-	if err := listener.Attach("example_tables"); err != nil {
+	if err := listener.Attach(ctx, "example_tables"); err != nil {
 		logrus.Fatal(err)
 	}
 

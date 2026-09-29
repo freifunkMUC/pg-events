@@ -1,6 +1,7 @@
 package pgevents
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -24,7 +25,7 @@ func testDatabase(t *testing.T) string {
 
 func openListener(t *testing.T, url string) *Listener {
 	t.Helper()
-	l, err := OpenListener(url)
+	l, err := OpenListener(context.Background(), url)
 	if err != nil {
 		t.Fatalf("OpenListener: %v", err)
 	}
@@ -96,13 +97,13 @@ func TestConcurrentOpenListener(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				l, err := OpenListener(url)
+				l, err := OpenListener(context.Background(), url)
 				if err != nil {
 					errs <- err
 					return
 				}
 				defer l.Close()
-				if err := l.Attach(table); err != nil {
+				if err := l.Attach(context.Background(), table); err != nil {
 					errs <- err
 				}
 			}()
@@ -119,7 +120,7 @@ func TestAttachNotifiesInsertUpdateDelete(t *testing.T) {
 	url := testDatabase(t)
 	table := uniqueTable(t, url)
 	l := openListener(t, url)
-	if err := l.Attach(table); err != nil {
+	if err := l.Attach(context.Background(), table); err != nil {
 		t.Fatal(err)
 	}
 	events, _ := collect(l)
@@ -146,7 +147,7 @@ func TestOversizedRowDoesNotBreakWrites(t *testing.T) {
 	url := testDatabase(t)
 	table := uniqueTable(t, url)
 	l := openListener(t, url)
-	if err := l.Attach(table); err != nil {
+	if err := l.Attach(context.Background(), table); err != nil {
 		t.Fatal(err)
 	}
 	events, _ := collect(l)
@@ -177,14 +178,14 @@ func TestAttachQuotesTableNames(t *testing.T) {
 	t.Cleanup(func() { exec(t, url, fmt.Sprintf(`DROP TABLE IF EXISTS "%s"`, name)) })
 
 	l := openListener(t, url)
-	if err := l.Attach(name); err != nil {
+	if err := l.Attach(context.Background(), name); err != nil {
 		t.Fatalf("Attach(%q): %v", name, err)
 	}
 }
 
 func TestCloseIsIdempotent(t *testing.T) {
 	url := testDatabase(t)
-	l, err := OpenListener(url)
+	l, err := OpenListener(context.Background(), url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +209,7 @@ func TestOnEventWhileEventsArrive(t *testing.T) {
 	url := testDatabase(t)
 	table := uniqueTable(t, url)
 	l := openListener(t, url)
-	if err := l.Attach(table); err != nil {
+	if err := l.Attach(context.Background(), table); err != nil {
 		t.Fatal(err)
 	}
 
@@ -246,10 +247,10 @@ func TestAttachActionsReportsOnlyThoseActions(t *testing.T) {
 	table := uniqueTable(t, url)
 	l := openListener(t, url)
 	// attaching again replaces the trigger instead of adding a second one
-	if err := l.Attach(table); err != nil {
+	if err := l.Attach(context.Background(), table); err != nil {
 		t.Fatal(err)
 	}
-	if err := l.AttachActions(table, Delete, Insert); err != nil {
+	if err := l.AttachActions(context.Background(), table, Delete, Insert); err != nil {
 		t.Fatal(err)
 	}
 	events, _ := collect(l)
@@ -275,10 +276,10 @@ func TestAttachActionsRejectsInvalidInput(t *testing.T) {
 	url := testDatabase(t)
 	table := uniqueTable(t, url)
 	l := openListener(t, url)
-	if err := l.AttachActions(table); err == nil {
+	if err := l.AttachActions(context.Background(), table); err == nil {
 		t.Error("no actions must be an error")
 	}
-	if err := l.AttachActions(table, "TRUNCATE"); err == nil {
+	if err := l.AttachActions(context.Background(), table, "TRUNCATE"); err == nil {
 		t.Error("an unknown action must be an error")
 	}
 }
@@ -292,7 +293,7 @@ func TestAttachKeepsUnquotedNameFolding(t *testing.T) {
 	t.Cleanup(func() { exec(t, url, "DROP TABLE IF EXISTS "+name) })
 
 	l := openListener(t, url)
-	if err := l.Attach(name); err != nil {
+	if err := l.Attach(context.Background(), name); err != nil {
 		t.Fatalf("Attach(%q) of an unquoted mixed-case table: %v", name, err)
 	}
 	events, _ := collect(l)
@@ -329,7 +330,7 @@ func TestCallbackPanicDoesNotStopDelivery(t *testing.T) {
 	table := uniqueTable(t, url)
 	listener := openListener(t, url)
 
-	if err := listener.Attach(table); err != nil {
+	if err := listener.Attach(context.Background(), table); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
@@ -349,7 +350,7 @@ func TestAttachWithoutRowLeavesTheRowOut(t *testing.T) {
 	table := uniqueTable(t, url)
 	listener := openListener(t, url)
 
-	if err := listener.AttachWithoutRow(table, Insert); err != nil {
+	if err := listener.AttachWithoutRow(context.Background(), table, Insert); err != nil {
 		t.Fatalf("AttachWithoutRow: %v", err)
 	}
 	events, _ := collect(listener)
@@ -376,10 +377,10 @@ func TestAttachAfterAttachWithoutRowReportsTheRowAgain(t *testing.T) {
 	table := uniqueTable(t, url)
 	listener := openListener(t, url)
 
-	if err := listener.AttachWithoutRow(table, Insert); err != nil {
+	if err := listener.AttachWithoutRow(context.Background(), table, Insert); err != nil {
 		t.Fatalf("AttachWithoutRow: %v", err)
 	}
-	if err := listener.Attach(table); err != nil {
+	if err := listener.Attach(context.Background(), table); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 	events, _ := collect(listener)
@@ -402,7 +403,7 @@ func TestAttachSchemaQualifiedTable(t *testing.T) {
 	exec(t, url, fmt.Sprintf("CREATE TABLE %s.rows (id serial PRIMARY KEY, name text)", schema))
 
 	listener := openListener(t, url)
-	if err := listener.Attach(schema + ".rows"); err != nil {
+	if err := listener.Attach(context.Background(), schema+".rows"); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 	events, _ := collect(listener)
@@ -442,7 +443,7 @@ func TestListenerReconnects(t *testing.T) {
 
 	table := uniqueTable(t, url)
 	listener := openListener(t, url)
-	if err := listener.Attach(table); err != nil {
+	if err := listener.Attach(context.Background(), table); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
