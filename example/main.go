@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/freifunkMUC/pg-events/pkg/pgevents"
-
-	"github.com/jinzhu/gorm"
-	_ "github.com/jinzhu/gorm/dialects/postgres"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+
+	"github.com/freifunkMUC/pg-events/pkg/pgevents"
 )
 
 type ExampleTable struct {
@@ -20,14 +19,16 @@ type ExampleTable struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-func OpenGorm(connectionString string) (*gorm.DB, error) {
-	db, err := gorm.Open("postgres", connectionString)
+func openGorm(connectionString string) (*gorm.DB, error) {
+	db, err := gorm.Open(postgres.Open(connectionString), &gorm.Config{})
 	if err != nil {
-		return nil, errors.Wrap(err, fmt.Sprintf("failed to connect to %s", "postgres"))
+		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
 	}
 
 	// Migrate the schema
-	db.AutoMigrate(&ExampleTable{})
+	if err := db.AutoMigrate(&ExampleTable{}); err != nil {
+		return nil, fmt.Errorf("failed to migrate the example table: %w", err)
+	}
 
 	return db, nil
 }
@@ -37,7 +38,7 @@ func main() {
 
 	connectionString := "host=localhost port=5432 sslmode=disable dbname=postgres user=postgres password=development"
 
-	db, err := OpenGorm(connectionString)
+	db, err := openGorm(connectionString)
 	if err != nil {
 		logrus.Fatal(err)
 	}
@@ -46,6 +47,7 @@ func main() {
 	if err != nil {
 		logrus.Fatal(err)
 	}
+	defer func() { _ = listener.Close() }()
 
 	if err := listener.Attach("example_tables"); err != nil {
 		logrus.Fatal(err)
@@ -62,8 +64,7 @@ func main() {
 		fmt.Println("reconnected")
 	})
 
-	i := 0
-	for {
+	for i := 0; ; i++ {
 		r := db.Save(&ExampleTable{
 			Name:      fmt.Sprintf("example-row-%d", i),
 			CreatedAt: time.Now(),
@@ -73,6 +74,5 @@ func main() {
 			logrus.Error(r.Error)
 		}
 		time.Sleep(5 * time.Second)
-		i++
 	}
 }

@@ -47,6 +47,17 @@ jobs:
       working-directory: example
       run: go build -v ./...
 
+    - name: Lint
+      uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+      with:
+        version: v2.13 # without patch version
+        args: --timeout 4m
+
+    # Known vulnerabilities in the dependencies and in the standard library
+    # this is built with. It reports only what the code actually reaches.
+    - name: Vulnerabilities
+      run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
     - name: Test
       env:
         PGEVENTS_TEST_DATABASE_URL: postgres://postgres:development@localhost:5432/postgres?sslmode=disable
