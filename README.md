@@ -15,14 +15,16 @@ Here's a quick example:
 func main() {
 	connectionString := "host=localhost port=5432 ..."
 
-	// connect to postgres
-	listener, err := pgevents.OpenListener(connectionString)
+	// connect to postgres. The context bounds getting started, not the
+	// listener's life: it runs until Close.
+	listener, err := pgevents.OpenListener(context.Background(), connectionString)
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer listener.Close()
 
 	// attach the listener to 1 or more table(s)
-	if err := listener.Attach("my_table"); err != nil {
+	if err := listener.Attach(context.Background(), "my_table"); err != nil {
 		log.Fatal(err)
 	}
 
@@ -40,7 +42,7 @@ to every listening connection, so if your application ignores some of them, atta
 only the ones you need:
 
 ```golang
-listener.AttachActions("my_table", pgevents.Insert, pgevents.Delete)
+listener.AttachActions(ctx, "my_table", pgevents.Insert, pgevents.Delete)
 ```
 
 A table has one pg-events trigger; attaching it again replaces the previous one.
@@ -74,7 +76,7 @@ That is how LISTEN/NOTIFY works, not something this library can grant or deny. W
 For a table whose contents must not travel, attach it without the row:
 
 ```golang
-listener.AttachWithoutRow("my_table", pgevents.Insert, pgevents.Update)
+listener.AttachWithoutRow(ctx, "my_table", pgevents.Insert, pgevents.Update)
 ```
 
 The event then says which table changed and how, `Data` is empty and `Truncated` is set - the same
@@ -84,12 +86,12 @@ your application connects as.
 ## Table names
 
 A name that is a valid unquoted SQL identifier is folded to lower case, exactly as
-Postgres does, so `Attach("MyTable")` refers to `mytable`. Names that need quoting,
+Postgres does, so `Attach(ctx, "MyTable")` refers to `mytable`. Names that need quoting,
 such as ones with spaces or reserved words like `user`, work as given. To refer to a
-case-sensitive table, pass the name in double quotes: `Attach("\"MyTable\"")`.
+case-sensitive table, pass the name in double quotes: `Attach(ctx, "\"MyTable\"")`.
 
-A name may name its schema: `Attach("reporting.events")`, and each part is quoted on its
-own. A dot inside a quoted name stays part of the name, so `Attach("\"reports.2026\"")`
+A name may name its schema: `Attach(ctx, "reporting.events")`, and each part is quoted on its
+own. A dot inside a quoted name stays part of the name, so `Attach(ctx, "\"reports.2026\"")`
 refers to one table.
 
 ## Connections

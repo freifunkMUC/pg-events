@@ -78,7 +78,11 @@ type OnEvent func(*TableEvent)
 
 type OnReconnect func()
 
-func OpenListener(connectionString string) (*Listener, error) {
+// OpenListener connects, installs the notify function and starts listening.
+// The context bounds that work - connecting to a database that is not there
+// fails when it runs out - and nothing after it: the listener runs until
+// Close, whatever becomes of the context.
+func OpenListener(ctx context.Context, connectionString string) (*Listener, error) {
 	config, err := pgx.ParseConfig(connectionString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse the connection string: %w", err)
@@ -89,12 +93,14 @@ func OpenListener(connectionString string) (*Listener, error) {
 		return nil, fmt.Errorf("failed to open sql connection: %w", err)
 	}
 
-	if err := setup(db, procedure()); err != nil {
+	if err := setup(ctx, db, procedure()); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to create postgres notify function: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// The listener's own context, which Close cancels. It is deliberately not
+	// derived from the one above: that one is about getting started.
+	listenCtx, cancel := context.WithCancel(context.Background())
 	l := &Listener{
 		cancel: cancel,
 		done:   make(chan struct{}),
@@ -112,14 +118,14 @@ func OpenListener(connectionString string) (*Listener, error) {
 		return nil, err
 	}
 
-	go l.listen(ctx, conn)
+	go l.listen(listenCtx, conn)
 
 	return l, nil
 }
 
 // Attach installs a trigger on table that reports inserts, updates and deletes.
-func (l *Listener) Attach(table string) error {
-	return l.AttachActions(table, Insert, Update, Delete)
+func (l *Listener) Attach(ctx context.Context, table string) error {
+	return l.AttachActions(ctx, table, Insert, Update, Delete)
 }
 
 // AttachActions installs a trigger on table that reports only the given
@@ -128,12 +134,12 @@ func (l *Listener) Attach(table string) error {
 //
 // A table has a single pg-events trigger: attaching it again, with the same or
 // other actions, replaces the previous one.
-func (l *Listener) AttachActions(table string, actions ...Action) error {
+func (l *Listener) AttachActions(ctx context.Context, table string, actions ...Action) error {
 	ordered, err := normalizeActions(actions)
 	if err != nil {
 		return fmt.Errorf("failed to attach listener: %w", err)
 	}
-	if err := setup(l.db, dropTrigger(table), createTrigger(table, ordered, true)); err != nil {
+	if err := setup(ctx, l.db, dropTrigger(table), createTrigger(table, ordered, true)); err != nil {
 		return fmt.Errorf("failed to attach listener: %w", err)
 	}
 	return nil
@@ -146,12 +152,12 @@ func (l *Listener) AttachActions(table string, actions ...Action) error {
 // Use it for tables whose contents must not travel: a notification reaches
 // every connection that listens on the channel, and table privileges do not
 // apply to it. See "What the notifications expose" in the README.
-func (l *Listener) AttachWithoutRow(table string, actions ...Action) error {
+func (l *Listener) AttachWithoutRow(ctx context.Context, table string, actions ...Action) error {
 	ordered, err := normalizeActions(actions)
 	if err != nil {
 		return fmt.Errorf("failed to attach listener: %w", err)
 	}
-	if err := setup(l.db, dropTrigger(table), createTrigger(table, ordered, false)); err != nil {
+	if err := setup(ctx, l.db, dropTrigger(table), createTrigger(table, ordered, false)); err != nil {
 		return fmt.Errorf("failed to attach listener: %w", err)
 	}
 	return nil
@@ -184,17 +190,17 @@ func normalizeActions(actions []Action) ([]Action, error) {
 // transaction-scoped advisory lock, so applications starting at the same time
 // do not install the function or triggers concurrently. The lock is released
 // with the transaction, whatever happens.
-func setup(db *sql.DB, statements ...string) error {
-	tx, err := db.Begin()
+func setup(ctx context.Context, db *sql.DB, statements ...string) error {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec("SELECT pg_advisory_xact_lock($1)", setupLockKey); err != nil {
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", setupLockKey); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
 	for _, statement := range statements {
-		if _, err := tx.Exec(statement); err != nil {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
