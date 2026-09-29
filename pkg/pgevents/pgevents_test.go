@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -33,7 +34,7 @@ func openListener(t *testing.T, url string) *Listener {
 
 func exec(t *testing.T, url string, statements ...string) {
 	t.Helper()
-	db, err := sql.Open("postgres", url)
+	db, err := sql.Open("pgx", url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +151,7 @@ func TestOversizedRowDoesNotBreakWrites(t *testing.T) {
 	}
 	events, _ := collect(l)
 
-	db, err := sql.Open("postgres", url)
+	db, err := sql.Open("pgx", url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +212,7 @@ func TestOnEventWhileEventsArrive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err := sql.Open("postgres", url)
+	db, err := sql.Open("pgx", url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,5 +427,39 @@ func TestSplitQualified(t *testing.T) {
 		if schema != tc.schema || name != tc.name {
 			t.Errorf("splitQualified(%q) = %q, %q, want %q, %q", tc.in, schema, name, tc.schema, tc.name)
 		}
+	}
+}
+
+// The connection can go away: a server restart, a firewall that forgets the
+// flow, a network blip. The listener has to come back on its own, say so - the
+// notifications sent meanwhile are gone - and keep delivering.
+func TestListenerReconnects(t *testing.T) {
+	url := testDatabase(t)
+
+	previous := minReconnectDelay
+	minReconnectDelay = 50 * time.Millisecond
+	t.Cleanup(func() { minReconnectDelay = previous })
+
+	table := uniqueTable(t, url)
+	listener := openListener(t, url)
+	if err := listener.Attach(table); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	var reconnects atomic.Int32
+	listener.OnReconnect(func() { reconnects.Add(1) })
+	events, _ := collect(listener)
+
+	// the connection that listens is the one whose last query was the LISTEN
+	exec(t, url, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+		WHERE query LIKE 'LISTEN%' AND pid <> pg_backend_pid()`)
+
+	waitFor(t, "the listener to reconnect", func() bool { return reconnects.Load() > 0 })
+
+	exec(t, url, fmt.Sprintf("INSERT INTO %s (name) VALUES ('after-the-reconnect')", table))
+	waitFor(t, "an event after the reconnect", func() bool { return len(events()) > 0 })
+
+	if event := events()[0]; !strings.Contains(event.Data, "after-the-reconnect") {
+		t.Errorf("event = %+v, want the row written after the reconnect", event)
 	}
 }

@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5"
 )
 
 // setupLockKey is the advisory lock that serializes installing the notify
@@ -100,7 +100,8 @@ func createTrigger(table string, actions []Action, withRow bool) string {
 	}
 	arguments := ""
 	if !withRow {
-		arguments = pq.QuoteLiteral(withoutRowArgument)
+		// A constant of this package, not anything a caller passes in.
+		arguments = "'" + withoutRowArgument + "'"
 	}
 	return fmt.Sprintf(
 		"CREATE TRIGGER %s AFTER %s ON %s FOR EACH ROW EXECUTE PROCEDURE pgevents_notify_event(%s)",
@@ -112,7 +113,7 @@ func createTrigger(table string, actions []Action, withRow bool) string {
 // schema of its table, so the schema is not part of its name.
 func triggerName(table string) string {
 	_, name := splitQualified(table)
-	return pq.QuoteIdentifier(identifierName(name) + "_events")
+	return pgx.Identifier{identifierName(name) + "_events"}.Sanitize()
 }
 
 var unquotedIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_$]*$`)
@@ -126,9 +127,9 @@ var unquotedIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_$]*$`)
 func identifier(table string) string {
 	schema, name := splitQualified(table)
 	if schema == "" {
-		return pq.QuoteIdentifier(identifierName(name))
+		return pgx.Identifier{identifierName(name)}.Sanitize()
 	}
-	return pq.QuoteIdentifier(identifierName(schema)) + "." + pq.QuoteIdentifier(identifierName(name))
+	return pgx.Identifier{identifierName(schema), identifierName(name)}.Sanitize()
 }
 
 // splitQualified separates a schema-qualified name into its two parts. Only a

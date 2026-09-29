@@ -1,40 +1,57 @@
 package pgevents
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime/debug"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	_ "github.com/jackc/pgx/v5/stdlib" // the database/sql driver used for the DDL
 	"github.com/sirupsen/logrus"
 )
 
-// pingInterval is how often the connection is checked. A var so the tests can
-// shorten it.
+// channel is the one every trigger notifies on. See "What the notifications
+// expose" in the README.
+const channel = "pgevents_event"
+
+// pingInterval is how long the listener waits for a notification before it
+// makes sure the connection is still there. A var so the tests can shorten it.
 var pingInterval = time.Minute
 
+// pingTimeout bounds that check: a connection that does not answer in this
+// long is treated as gone, and the listener reconnects.
+var pingTimeout = 10 * time.Second
+
+// The delays between reconnection attempts, doubling from one to the next.
+var (
+	minReconnectDelay = time.Second
+	maxReconnectDelay = time.Minute
+)
+
 type Listener struct {
-	stop      chan struct{}
-	done      chan struct{}
 	closeOnce sync.Once
 	closeErr  error
-	db        *sql.DB
-	pql       *pq.Listener
+	// cancel ends the goroutine that listens; done is closed once it has.
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	// db installs the function and the triggers; config opens the connection
+	// that listens, which cannot come from a pool - it has to stay the same
+	// connection for as long as it listens.
+	db     *sql.DB
+	config *pgx.ConnConfig
 
 	// mu guards the callbacks: they may be registered while notifications
 	// are already being delivered.
 	mu                 sync.RWMutex
 	eventCallbacks     []OnEvent
 	reconnectCallbacks []OnReconnect
-
-	// pinging is set while a connection check is running, so they cannot pile
-	// up behind one that blocks.
-	pinging atomic.Bool
 }
 
 type TableEvent struct {
@@ -62,7 +79,12 @@ type OnEvent func(*TableEvent)
 type OnReconnect func()
 
 func OpenListener(connectionString string) (*Listener, error) {
-	db, err := sql.Open("postgres", connectionString)
+	config, err := pgx.ParseConfig(connectionString)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse the connection string: %w", err)
+	}
+
+	db, err := sql.Open("pgx", connectionString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sql connection: %w", err)
 	}
@@ -72,18 +94,25 @@ func OpenListener(connectionString string) (*Listener, error) {
 		return nil, fmt.Errorf("failed to create postgres notify function: %w", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	l := &Listener{
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
-		db:   db,
-		pql:  pq.NewListener(connectionString, 10*time.Second, time.Minute, logListenerEvent),
+		cancel: cancel,
+		done:   make(chan struct{}),
+		db:     db,
+		config: config,
 	}
 
-	if err := l.start(); err != nil {
-		_ = l.pql.Close()
+	// The first connection is made here rather than in the background, so that
+	// a connection that cannot be made is an error from OpenListener instead
+	// of a line in the log every few seconds.
+	conn, err := l.connect(ctx)
+	if err != nil {
+		cancel()
 		_ = db.Close()
 		return nil, err
 	}
+
+	go l.listen(ctx, conn)
 
 	return l, nil
 }
@@ -185,66 +214,130 @@ func (l *Listener) OnReconnect(cb OnReconnect) {
 	l.reconnectCallbacks = append(l.reconnectCallbacks, cb)
 }
 
-func logListenerEvent(event pq.ListenerEventType, err error) {
-	switch event {
-	case pq.ListenerEventDisconnected:
-		logrus.Warn(fmt.Errorf("pgevents lost its postgres connection: %w", err))
-	case pq.ListenerEventConnectionAttemptFailed:
-		logrus.Warn(fmt.Errorf("pgevents failed to reconnect to postgres: %w", err))
-	case pq.ListenerEventReconnected:
-		logrus.Info("pgevents reconnected to postgres")
+// connect opens a connection of its own and starts listening on the channel.
+func (l *Listener) connect(ctx context.Context) (*pgx.Conn, error) {
+	conn, err := pgx.ConnectConfig(ctx, l.config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
 	}
+	if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{channel}.Sanitize()); err != nil {
+		_ = conn.Close(ctx)
+		return nil, fmt.Errorf("failed to listen to postgres events: %w", err)
+	}
+	return conn, nil
 }
 
-func (l *Listener) start() error {
-	if err := l.pql.Listen("pgevents_event"); err != nil {
-		return fmt.Errorf("failed to listen to postgres events: %w", err)
-	}
-
-	go func() {
-		defer close(l.done)
-		ticker := time.NewTicker(pingInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-l.stop:
-				logrus.Debug("finished listening for events")
-				return
-			case notification := <-l.pql.NotificationChannel():
-				if notification != nil {
-					logrus.Debugf("received data from channel: %s", notification.Channel)
-					l.emitEvent(notification)
-				} else {
-					// a nil notification is documented to mean that
-					// the connection has been lost and then re-established
-					// i.e. a reconnect occurred and some notifications may
-					// have been missed.
-					logrus.Debug("received nil from channel indicating reconnect")
-					l.emitReconnect()
-				}
-			case <-ticker.C:
-				// One check at a time: a dead connection makes Ping block, and
-				// a goroutine per tick would pile up behind it.
-				if l.pinging.CompareAndSwap(false, true) {
-					go func() {
-						defer l.pinging.Store(false)
-						logrus.Debug("checking the postgres connection")
-						if err := l.pql.Ping(); err != nil {
-							logrus.Error(fmt.Errorf("pgevents ping returned an error: %w", err))
-						}
-					}()
-				}
-			}
+// listen delivers notifications until the listener is closed. A connection
+// that breaks is replaced, and the reconnect callbacks are told: notifications
+// sent while there was none are gone, so whoever keeps a copy of the data has
+// to read it again.
+func (l *Listener) listen(ctx context.Context, conn *pgx.Conn) {
+	defer close(l.done)
+	defer func() {
+		if conn != nil {
+			l.disconnect(conn)
 		}
 	}()
 
-	return nil
+	for {
+		if conn == nil {
+			var err error
+			conn, err = l.reconnect(ctx)
+			if err != nil {
+				return // the listener was closed while it was reconnecting
+			}
+			logrus.Info("pgevents reconnected to postgres")
+			l.emitReconnect()
+		}
+
+		if l.receive(ctx, conn) {
+			continue
+		}
+
+		l.disconnect(conn)
+		conn = nil
+		if ctx.Err() != nil {
+			return
+		}
+	}
 }
 
-func (l *Listener) emitEvent(notification *pq.Notification) {
+// receive waits for one notification and reports whether the connection can
+// keep being used.
+func (l *Listener) receive(ctx context.Context, conn *pgx.Conn) bool {
+	// The wait is bounded so that a quiet connection is checked now and then:
+	// one that went away without a FIN would otherwise be waited on forever.
+	// A wait that runs out leaves the connection usable - pgx only discards it
+	// on errors that are not timeouts.
+	waitCtx, cancel := context.WithTimeout(ctx, pingInterval)
+	notification, err := conn.WaitForNotification(waitCtx)
+	cancel()
+
+	switch {
+	case err == nil:
+		logrus.Debugf("received data from channel: %s", notification.Channel)
+		l.emitEvent(notification)
+		return true
+
+	case ctx.Err() != nil:
+		return false
+
+	case pgconn.Timeout(err):
+		logrus.Debug("no events received for a while: checking the connection")
+		pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
+		defer cancel()
+		if err := conn.Ping(pingCtx); err != nil {
+			logrus.Warn(fmt.Errorf("pgevents lost its postgres connection: %w", err))
+			return false
+		}
+		return true
+
+	default:
+		logrus.Warn(fmt.Errorf("pgevents lost its postgres connection: %w", err))
+		return false
+	}
+}
+
+// reconnect opens a new connection, waiting longer between attempts as they
+// keep failing. It returns an error only when the listener was closed.
+func (l *Listener) reconnect(ctx context.Context) (*pgx.Conn, error) {
+	delay := minReconnectDelay
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+
+		conn, err := l.connect(ctx)
+		if err == nil {
+			return conn, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		logrus.Warn(fmt.Errorf("pgevents failed to reconnect to postgres: %w", err))
+		if delay *= 2; delay > maxReconnectDelay {
+			delay = maxReconnectDelay
+		}
+	}
+}
+
+// disconnect closes a connection that will not be used again. The listener's
+// own context may be cancelled by then, which is why closing does not use it.
+func (l *Listener) disconnect(conn *pgx.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), pingTimeout)
+	defer cancel()
+	if err := conn.Close(ctx); err != nil {
+		logrus.Debugf("closing the postgres connection: %v", err)
+	}
+}
+
+func (l *Listener) emitEvent(notification *pgconn.Notification) {
 	event := &TableEvent{}
 
-	if err := json.Unmarshal([]byte(notification.Extra), event); err != nil {
+	if err := json.Unmarshal([]byte(notification.Payload), event); err != nil {
 		logrus.Error(fmt.Errorf("failed to unmarshal table event: %w", err))
 		return
 	}
@@ -287,14 +380,9 @@ func safely(cb func()) {
 // from inside a callback. Calling it more than once is safe.
 func (l *Listener) Close() error {
 	l.closeOnce.Do(func() {
-		close(l.stop)
+		l.cancel()
 		<-l.done
-		if err := l.pql.Close(); err != nil {
-			l.closeErr = err
-		}
-		if err := l.db.Close(); err != nil && l.closeErr == nil {
-			l.closeErr = err
-		}
+		l.closeErr = l.db.Close()
 	})
 	return l.closeErr
 }
