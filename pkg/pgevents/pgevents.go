@@ -3,12 +3,12 @@ package pgevents
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/lib/pq"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -53,12 +53,12 @@ type OnReconnect func()
 func OpenListener(connectionString string) (*Listener, error) {
 	db, err := sql.Open("postgres", connectionString)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to open sql connection")
+		return nil, fmt.Errorf("failed to open sql connection: %w", err)
 	}
 
 	if err := setup(db, procedure()); err != nil {
 		_ = db.Close()
-		return nil, errors.Wrap(err, "failed to create postgres notify function")
+		return nil, fmt.Errorf("failed to create postgres notify function: %w", err)
 	}
 
 	l := &Listener{
@@ -91,10 +91,10 @@ func (l *Listener) Attach(table string) error {
 func (l *Listener) AttachActions(table string, actions ...Action) error {
 	ordered, err := normalizeActions(actions)
 	if err != nil {
-		return errors.Wrap(err, "failed to attach listener")
+		return fmt.Errorf("failed to attach listener: %w", err)
 	}
 	if err := setup(l.db, dropTrigger(table), createTrigger(table, ordered)); err != nil {
-		return errors.Wrap(err, "failed to attach listener")
+		return fmt.Errorf("failed to attach listener: %w", err)
 	}
 	return nil
 }
@@ -159,9 +159,9 @@ func (l *Listener) OnReconnect(cb OnReconnect) {
 func logListenerEvent(event pq.ListenerEventType, err error) {
 	switch event {
 	case pq.ListenerEventDisconnected:
-		logrus.Warn(errors.Wrap(err, "pgevents lost its postgres connection"))
+		logrus.Warn(fmt.Errorf("pgevents lost its postgres connection: %w", err))
 	case pq.ListenerEventConnectionAttemptFailed:
-		logrus.Warn(errors.Wrap(err, "pgevents failed to reconnect to postgres"))
+		logrus.Warn(fmt.Errorf("pgevents failed to reconnect to postgres: %w", err))
 	case pq.ListenerEventReconnected:
 		logrus.Info("pgevents reconnected to postgres")
 	}
@@ -169,7 +169,7 @@ func logListenerEvent(event pq.ListenerEventType, err error) {
 
 func (l *Listener) start() error {
 	if err := l.pql.Listen("pgevents_event"); err != nil {
-		return errors.Wrap(err, "failed to listen to postgres events")
+		return fmt.Errorf("failed to listen to postgres events: %w", err)
 	}
 
 	go func() {
@@ -195,7 +195,7 @@ func (l *Listener) start() error {
 				logrus.Debug("no events received for 1 minute: checking connection")
 				go func() {
 					if err := l.pql.Ping(); err != nil {
-						logrus.Error(errors.Wrap(err, "pgevents ping returned an error"))
+						logrus.Error(fmt.Errorf("pgevents ping returned an error: %w", err))
 					}
 				}()
 			}
@@ -209,7 +209,7 @@ func (l *Listener) emitEvent(notification *pq.Notification) {
 	event := &TableEvent{}
 
 	if err := json.Unmarshal([]byte(notification.Extra), event); err != nil {
-		logrus.Error(errors.Wrap(err, "failed to unmarshal table event"))
+		logrus.Error(fmt.Errorf("failed to unmarshal table event: %w", err))
 		return
 	}
 
