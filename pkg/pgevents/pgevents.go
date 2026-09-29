@@ -5,12 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 )
+
+// pingInterval is how often the connection is checked. A var so the tests can
+// shorten it.
+var pingInterval = time.Minute
 
 type Listener struct {
 	stop      chan struct{}
@@ -25,16 +31,21 @@ type Listener struct {
 	mu                 sync.RWMutex
 	eventCallbacks     []OnEvent
 	reconnectCallbacks []OnReconnect
+
+	// pinging is set while a connection check is running, so they cannot pile
+	// up behind one that blocks.
+	pinging atomic.Bool
 }
 
 type TableEvent struct {
-	Table  string
-	Action string
-	Data   string
-	// Truncated is set when the row did not fit into a NOTIFY payload
-	// (8000 bytes). Data is empty then; read the row from the table if you
-	// need it.
-	Truncated bool
+	Table  string `json:"table"`
+	Action string `json:"action"`
+	Data   string `json:"data"`
+	// Truncated is set when the event carries no row: it did not fit into a
+	// NOTIFY payload (8000 bytes), or the trigger was installed with
+	// AttachWithoutRow. Data is empty then; read the row from the table if
+	// you need it.
+	Truncated bool `json:"truncated"`
 }
 
 // Action is a kind of table change a trigger reports.
@@ -93,7 +104,25 @@ func (l *Listener) AttachActions(table string, actions ...Action) error {
 	if err != nil {
 		return fmt.Errorf("failed to attach listener: %w", err)
 	}
-	if err := setup(l.db, dropTrigger(table), createTrigger(table, ordered)); err != nil {
+	if err := setup(l.db, dropTrigger(table), createTrigger(table, ordered, true)); err != nil {
+		return fmt.Errorf("failed to attach listener: %w", err)
+	}
+	return nil
+}
+
+// AttachWithoutRow installs a trigger that reports a change without the row in
+// it: Data is empty and Truncated is set, as for a row too large to send. Read
+// the row from the table when you need it.
+//
+// Use it for tables whose contents must not travel: a notification reaches
+// every connection that listens on the channel, and table privileges do not
+// apply to it. See "What the notifications expose" in the README.
+func (l *Listener) AttachWithoutRow(table string, actions ...Action) error {
+	ordered, err := normalizeActions(actions)
+	if err != nil {
+		return fmt.Errorf("failed to attach listener: %w", err)
+	}
+	if err := setup(l.db, dropTrigger(table), createTrigger(table, ordered, false)); err != nil {
 		return fmt.Errorf("failed to attach listener: %w", err)
 	}
 	return nil
@@ -174,6 +203,8 @@ func (l *Listener) start() error {
 
 	go func() {
 		defer close(l.done)
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-l.stop:
@@ -191,13 +222,18 @@ func (l *Listener) start() error {
 					logrus.Debug("received nil from channel indicating reconnect")
 					l.emitReconnect()
 				}
-			case <-time.After(1 * time.Minute):
-				logrus.Debug("no events received for 1 minute: checking connection")
-				go func() {
-					if err := l.pql.Ping(); err != nil {
-						logrus.Error(fmt.Errorf("pgevents ping returned an error: %w", err))
-					}
-				}()
+			case <-ticker.C:
+				// One check at a time: a dead connection makes Ping block, and
+				// a goroutine per tick would pile up behind it.
+				if l.pinging.CompareAndSwap(false, true) {
+					go func() {
+						defer l.pinging.Store(false)
+						logrus.Debug("checking the postgres connection")
+						if err := l.pql.Ping(); err != nil {
+							logrus.Error(fmt.Errorf("pgevents ping returned an error: %w", err))
+						}
+					}()
+				}
 			}
 		}
 	}()
@@ -220,7 +256,7 @@ func (l *Listener) emitEvent(notification *pq.Notification) {
 	l.mu.RUnlock()
 
 	for _, cb := range callbacks {
-		cb(event)
+		safely(func() { cb(event) })
 	}
 }
 
@@ -230,8 +266,20 @@ func (l *Listener) emitReconnect() {
 	l.mu.RUnlock()
 
 	for _, cb := range callbacks {
-		cb()
+		safely(cb)
 	}
+}
+
+// safely runs a callback of the application. A panic in one used to end the
+// goroutine that delivers events, which left the listener connected and
+// silent: no further event reached any callback, and nothing said why.
+func safely(cb func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			logrus.Errorf("pgevents: a callback panicked: %v\n%s", r, debug.Stack())
+		}
+	}()
+	cb()
 }
 
 // Close stops delivering events and closes the connections. It waits until a

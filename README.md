@@ -51,12 +51,46 @@ Postgres rejects NOTIFY payloads of 8000 bytes or more. Instead of letting that
 error abort your write, pg-events then sends the event without the row: `Data` is
 empty and `Truncated` is `true`. Read the row from the table if you need it.
 
+## What the notifications expose
+
+A notification reaches **every connection that listens on the channel**, and Postgres does not apply
+table privileges to it. A user who may connect to the database but may not read the table still sees
+every row it writes:
+
+```
+postgres=> SELECT * FROM leaktest;
+ERROR:  permission denied for table leaktest
+
+postgres=> LISTEN pgevents_event;
+Asynchronous notification "pgevents_event" with payload
+"{"table":"leaktest","action":"INSERT","data":"{\"id\":1,\"secret\":\"...\"}"}" received
+```
+
+That is how LISTEN/NOTIFY works, not something this library can grant or deny. What follows from it:
+
+- Treat a table you attach as readable by anyone who may connect to that database.
+- Applications sharing a database also receive each other's events, since the channel is one.
+
+For a table whose contents must not travel, attach it without the row:
+
+```golang
+listener.AttachWithoutRow("my_table", pgevents.Insert, pgevents.Update)
+```
+
+The event then says which table changed and how, `Data` is empty and `Truncated` is set - the same
+shape as for a row too large to send. Read the row from the table when you need it, as whatever user
+your application connects as.
+
 ## Table names
 
 A name that is a valid unquoted SQL identifier is folded to lower case, exactly as
 Postgres does, so `Attach("MyTable")` refers to `mytable`. Names that need quoting,
 such as ones with spaces or reserved words like `user`, work as given. To refer to a
 case-sensitive table, pass the name in double quotes: `Attach("\"MyTable\"")`.
+
+A name may name its schema: `Attach("reporting.events")`, and each part is quoted on its
+own. A dot inside a quoted name stays part of the name, so `Attach("\"reports.2026\"")`
+refers to one table.
 
 ## Running several applications against one database
 
@@ -68,6 +102,9 @@ a rolling upgrade from one, a start can still fail once and succeed on retry.
 Calling `OnEvent`, `OnReconnect` and `Close` concurrently with event delivery is
 safe, and `Close` may be called more than once. Do not call `Close` from inside a
 callback: it waits for running callbacks to return.
+
+A callback that panics is logged with its stack and the listener carries on, so one
+broken handler does not leave the application connected and silent.
 
 ## Tests
 
