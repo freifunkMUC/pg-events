@@ -320,3 +320,111 @@ func TestIdentifier(t *testing.T) {
 		t.Errorf("triggerName = %s", got)
 	}
 }
+
+// A panic in a callback used to end the goroutine that delivers events: the
+// listener stayed connected and silent, and nothing said why.
+func TestCallbackPanicDoesNotStopDelivery(t *testing.T) {
+	url := testDatabase(t)
+	table := uniqueTable(t, url)
+	listener := openListener(t, url)
+
+	if err := listener.Attach(table); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	listener.OnEvent(func(*TableEvent) { panic("a callback of the application") })
+	events, _ := collect(listener)
+
+	exec(t, url, fmt.Sprintf("INSERT INTO %s (name) VALUES ('first')", table))
+	exec(t, url, fmt.Sprintf("INSERT INTO %s (name) VALUES ('second')", table))
+
+	waitFor(t, "the events after a panicking callback", func() bool { return len(events()) >= 2 })
+}
+
+// A table whose contents must not travel: the notification says that something
+// changed and nothing about what.
+func TestAttachWithoutRowLeavesTheRowOut(t *testing.T) {
+	url := testDatabase(t)
+	table := uniqueTable(t, url)
+	listener := openListener(t, url)
+
+	if err := listener.AttachWithoutRow(table, Insert); err != nil {
+		t.Fatalf("AttachWithoutRow: %v", err)
+	}
+	events, _ := collect(listener)
+
+	exec(t, url, fmt.Sprintf("INSERT INTO %s (name) VALUES ('a-secret')", table))
+
+	waitFor(t, "an event without the row", func() bool { return len(events()) == 1 })
+	event := events()[0]
+	if event.Data != "" {
+		t.Errorf("the event carries the row: %q", event.Data)
+	}
+	if !event.Truncated {
+		t.Error("the event does not say that the row is missing")
+	}
+	if event.Action != "INSERT" || event.Table != table {
+		t.Errorf("event = %+v, want the insert on %s", event, table)
+	}
+}
+
+// Attaching with the row again replaces the trigger, so a table does not stay
+// silent because it once was attached without it.
+func TestAttachAfterAttachWithoutRowReportsTheRowAgain(t *testing.T) {
+	url := testDatabase(t)
+	table := uniqueTable(t, url)
+	listener := openListener(t, url)
+
+	if err := listener.AttachWithoutRow(table, Insert); err != nil {
+		t.Fatalf("AttachWithoutRow: %v", err)
+	}
+	if err := listener.Attach(table); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	events, _ := collect(listener)
+
+	exec(t, url, fmt.Sprintf("INSERT INTO %s (name) VALUES ('visible')", table))
+
+	waitFor(t, "an event with the row", func() bool { return len(events()) == 1 })
+	if event := events()[0]; !strings.Contains(event.Data, "visible") || event.Truncated {
+		t.Errorf("event = %+v, want the row back", event)
+	}
+}
+
+// A table in another schema used to be unreachable: the whole name was quoted
+// as one identifier, and Postgres reported a relation that does not exist.
+func TestAttachSchemaQualifiedTable(t *testing.T) {
+	url := testDatabase(t)
+	schema := fmt.Sprintf("pgevents_schema_%d", time.Now().UnixNano())
+	exec(t, url, fmt.Sprintf("CREATE SCHEMA %s", schema))
+	t.Cleanup(func() { exec(t, url, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schema)) })
+	exec(t, url, fmt.Sprintf("CREATE TABLE %s.rows (id serial PRIMARY KEY, name text)", schema))
+
+	listener := openListener(t, url)
+	if err := listener.Attach(schema + ".rows"); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	events, _ := collect(listener)
+
+	exec(t, url, fmt.Sprintf("INSERT INTO %s.rows (name) VALUES ('in-a-schema')", schema))
+
+	waitFor(t, "an event for the table in another schema", func() bool { return len(events()) == 1 })
+	if event := events()[0]; event.Table != "rows" || !strings.Contains(event.Data, "in-a-schema") {
+		t.Errorf("event = %+v, want the insert on the table in the schema", event)
+	}
+}
+
+func TestSplitQualified(t *testing.T) {
+	for _, tc := range []struct{ in, schema, name string }{
+		{"devices", "", "devices"},
+		{"public.devices", "public", "devices"},
+		{`"My Schema"."My Table"`, `"My Schema"`, `"My Table"`},
+		// a dot inside quotes belongs to the name
+		{`"reports.2026"`, "", `"reports.2026"`},
+	} {
+		schema, name := splitQualified(tc.in)
+		if schema != tc.schema || name != tc.name {
+			t.Errorf("splitQualified(%q) = %q, %q, want %q, %q", tc.in, schema, name, tc.schema, tc.name)
+		}
+	}
+}
